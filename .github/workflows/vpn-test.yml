@@ -1,0 +1,52 @@
+name: vpn-smoke-test
+
+on:
+  workflow_dispatch:    # manual trigger only
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps (before VPN, in case tunnel hijacks all traffic)
+        run: |
+          pip install pymssql
+          sudo apt-get update && sudo apt-get install -y openvpn
+
+      - name: Connect VPN
+        run: |
+          echo "${{ secrets.OVPN_CONFIG_B64 }}" | base64 -d > client.ovpn
+          printf '%s\n%s\n' "${{ secrets.VPN_USER }}" "${{ secrets.VPN_PASS }}" > vpn-creds.txt
+          chmod 600 vpn-creds.txt
+          sudo openvpn --config client.ovpn --auth-user-pass vpn-creds.txt --daemon --log vpn.log
+          sleep 5
+          echo "--- vpn.log so far ---"
+          sudo cat vpn.log
+
+      - name: Test - can we reach the DB host?
+        run: |
+          timeout 60 bash -c 'until nc -z -w3 ${{ secrets.DB_HOST }} 1433; do echo "waiting..."; sleep 3; done' \
+            && echo "✅ Port 1433 reachable" \
+            || { echo "❌ Could not reach DB host"; sudo cat vpn.log; exit 1; }
+
+      - name: Test - can we authenticate and query?
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+        run: |
+          python - <<'EOF'
+          import os, pymssql
+          conn = pymssql.connect(
+              server=os.environ["DB_HOST"],
+              user=os.environ["DB_USER"],
+              password=os.environ["DB_PASS"],
+              timeout=15,
+          )
+          cur = conn.cursor()
+          cur.execute("SELECT 1, @@SERVERNAME, GETDATE()")
+          print("✅ Query succeeded:", cur.fetchone())
+          EOF
