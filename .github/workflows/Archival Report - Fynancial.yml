@@ -1,0 +1,67 @@
+name: Archival Report — Fynancial
+
+on:
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies (before VPN)
+        run: |
+          sudo apt-get update && sudo apt-get install -y openvpn poppler-utils
+          # ODBC driver for pyodbc
+          curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
+            | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update
+          ACCEPT_EULA=Y sudo apt-get install -y msodbcsql18 unixodbc-dev
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          uv sync
+
+      - name: Connect VPN
+        run: |
+          echo "${{ secrets.VPN_PROD_FYNANCIAL }}" | base64 -d > client.ovpn
+          sed -i '/block-outside-dns/d' client.ovpn
+          sudo openvpn --config client.ovpn --daemon --log vpn.log
+          sleep 5
+          echo "--- vpn.log so far ---"
+          sudo cat vpn.log
+
+      - name: Wait for DB to be reachable
+        run: |
+          timeout 60 bash -c 'until nc -z -w3 ${{ secrets.FYNANCIAL_DB_SERVER }} 1433; do echo "waiting..."; sleep 3; done' \
+            && echo "✅ Port 1433 reachable" \
+            || { echo "❌ Could not reach DB server"; sudo cat vpn.log; exit 1; }
+
+      - name: Generate report
+        env:
+          ENVIRONMENT:           FYNANCIAL
+          FYNANCIAL_DB_SERVER:   ${{ secrets.FYNANCIAL_DB_SERVER }}
+          FYNANCIAL_DB_NAME:     ${{ secrets.FYNANCIAL_DB_NAME }}
+          FYNANCIAL_DB_USER:     ${{ secrets.FYNANCIAL_DB_USER }}
+          FYNANCIAL_DB_PASSWORD: ${{ secrets.FYNANCIAL_DB_PASSWORD }}
+          SLACK_BOT_TOKEN:       ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL:         ${{ secrets.SLACK_CHANNEL }}
+        run: uv run python Archival/report.py
+
+      - name: Upload report as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fynancial-report-${{ github.run_id }}
+          path: |
+            archival-report-fynancial-*.pdf
+            archival-report-fynancial-*.png
+          retention-days: 30
+
+      - name: Dump VPN log on failure
+        if: failure()
+        run: sudo cat vpn.log
