@@ -114,6 +114,7 @@ def get_conn(prefix):
         f"DATABASE={os.environ[f'{prefix}_DB_NAME']};"
         f"UID={os.environ[f'{prefix}_DB_USER']};"
         f"PWD={os.environ[f'{prefix}_DB_PASSWORD']};"
+        f"TrustServerCertificate=yes;"
     )
     conn.autocommit = True
     return conn
