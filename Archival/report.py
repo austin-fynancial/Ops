@@ -107,8 +107,9 @@ def page_decorator(canv, doc):
 
 # ── DB connection ────────────────────────────────────────────────────────────
 def get_conn(prefix):
+    driver = "ODBC Driver 18 for SQL Server" if os.name != "nt" else "SQL Server"
     conn = pyodbc.connect(
-        f"DRIVER={{SQL Server}};"
+        f"DRIVER={{{driver}}};"
         f"SERVER={os.environ[f'{prefix}_DB_SERVER']};"
         f"DATABASE={os.environ[f'{prefix}_DB_NAME']};"
         f"UID={os.environ[f'{prefix}_DB_USER']};"
