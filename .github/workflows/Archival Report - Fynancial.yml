@@ -1,6 +1,8 @@
 name: Archival Report — Fynancial
 
 on:
+  schedule:
+    - cron: '0 12 * * *'  # 8 AM ET (EDT, UTC-4) — drifts to 7 AM in winter
   workflow_dispatch:
 
 jobs:
