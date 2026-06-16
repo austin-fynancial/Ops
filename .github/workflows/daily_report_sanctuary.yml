@@ -50,7 +50,7 @@ jobs:
           SANCTUARY_DB_PASSWORD: ${{ secrets.SANCTUARY_DB_PASSWORD }}
           SLACK_BOT_TOKEN:       ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL:         ${{ secrets.SLACK_CHANNEL }}
-        run: uv run python Archival/report.py
+        run: uv run python Archival/archival_report.py
 
       - name: Upload report as artifact
         if: always()
