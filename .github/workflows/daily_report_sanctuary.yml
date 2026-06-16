@@ -1,4 +1,4 @@
-name: Archival Report — Sanctuary
+name: Daily Report - Sanctuary
 
 on:
   workflow_dispatch:
