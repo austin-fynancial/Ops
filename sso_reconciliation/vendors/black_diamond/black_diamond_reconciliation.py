@@ -10,7 +10,7 @@ from rapidfuzz import fuzz
 # -----------------------------
 # Firm Configuration
 # -----------------------------
-FIRM_NAME = "legacy_financial"
+FIRM_NAME = ""
 FIRM_DIR = os.path.join(os.path.dirname(__file__), FIRM_NAME)
 os.makedirs(FIRM_DIR, exist_ok=True)
 

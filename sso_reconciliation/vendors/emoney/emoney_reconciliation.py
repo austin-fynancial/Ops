@@ -5,7 +5,7 @@ import re
 # -----------------------------
 # Firm Configuration
 # -----------------------------
-FIRM_NAME = "dialsquare"
+FIRM_NAME = ""
 
 # -----------------------------
 # Helpers
