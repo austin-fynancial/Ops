@@ -9,9 +9,19 @@ from rapidfuzz import fuzz
 # -----------------------------
 # Firm Configuration
 # -----------------------------
-FIRM_NAME = ""
+FIRM_NAME = "grimes"
 FIRM_DIR = os.path.join(os.path.dirname(__file__), FIRM_NAME)
 os.makedirs(FIRM_DIR, exist_ok=True)
+
+# When True: the Fynancial CSV is filtered down to only rows that have a
+# Fynancial_OrionId AND do not already have SSO (Fynancial_OrionUsername
+# blank). Use this when you've deliberately handed in a partial Fynancial
+# list (e.g. "who still needs SSO"), since in that case the Orion-side
+# "no Fynancial match" (purple) section would be meaningless noise — most of
+# it would just be people who DO have SSO but were left out of the CSV, not
+# genuine orphaned Orion records. That section is skipped entirely in this
+# mode. Leave this False for a normal full-firm reconciliation run.
+ONLY_NO_SSO_WITH_ORIONID = True
 
 # -----------------------------
 # Colors
@@ -66,6 +76,9 @@ def parse_household_members(raw_first, raw_last):
     Handles these patterns:
       1. Standard:      "Aaron & Julie"        | "Mueller"
                         → [("aaron", "mueller"), ("julie", "mueller")]
+                        A compound first name like "Mary Grace" is kept whole
+                        and still takes the shared last name — it is NOT
+                        split into a fake first/last pair.
 
       2. Trailing &:    "Vanessa Kelly &"      | "Sarah Levenson"
                         → [("vanessa", "kelly"), ("sarah", "levenson")]
@@ -75,6 +88,11 @@ def parse_household_members(raw_first, raw_last):
 
       4. Full names in first: "Ben Demick & Brandy Blevins" | "Demick"
                         → [("ben", "demick"), ("brandy", "blevins")]
+
+      5. Paired surnames: "Mark and Mary" | "DiStefano and Wendel"
+                        → [("mark", "distefano"), ("mary", "wendel")]
+                        Triggers only when LastName splits into the same
+                        number of parts as FirstName.
     """
     first = str(raw_first).strip()
     last = str(raw_last).strip()
@@ -121,19 +139,33 @@ def parse_household_members(raw_first, raw_last):
             members.append((normalize_val(sub[0]), normalize_val(" ".join(sub[1:]))))
         return members
 
-    # Pattern 1: Standard — each part is just a first name, shared last name
+    # Pattern 5 (NEW): LastName also splits into a matching count of parts —
+    # e.g. "Mark and Mary" | "DiStefano and Wendel" (two different surnames,
+    # paired by position), or "Alfred Jr. and Deborah" | "Chicoine and Ford".
+    last_parts = [p.strip() for p in splitter.split(last) if p.strip()]
+    if len(last_parts) > 1 and len(last_parts) == len(parts):
+        for fp, lp in zip(parts, last_parts):
+            members.append((normalize_val(fp), normalize_val(lp)))
+        return members
+
+    # Pattern 1: Standard — each part is just a first name, shared last name.
+    # A part with an internal space (e.g. "Mary Grace") is a compound first
+    # name, not a first+last pair — it still takes the shared last name.
     shared_last = normalize_val(last)
     for p in parts:
-        # Part might itself be a full name if it has a space (mixed case like "Andrew Eggum & Teresa")
-        sub = p.split()
-        if len(sub) >= 2:
-            members.append((normalize_val(sub[0]), normalize_val(" ".join(sub[1:]))))
-        else:
-            members.append((normalize_val(p), shared_last))
+        members.append((normalize_val(p), shared_last))
 
     return members
 
 def get_group_key(row):
+    # An Orion_No_Fynancial_Match row that only shares its Orion_Id with a
+    # matched record because of a duplicate Orion *source* record (a
+    # different Orion_OrionId under the same Orion_Id) should stand on its
+    # own — it belongs with the other unmatched/purple records, not grouped
+    # in with the record that did match.
+    if (row.get("match_type") == "Orion_No_Fynancial_Match" and
+            pd.notna(row["Orion_Id"]) and row["Orion_Id"] in duplicate_source_orion_ids):
+        return f"orion_source_dupe_{row.name}"
     # If Orion_Id is shared, that takes priority for grouping
     if pd.notna(row["Orion_Id"]) and row["Orion_Id"] in duplicate_orion_ids:
         return f"orion_{row['Orion_Id']}"
@@ -154,6 +186,11 @@ def get_group_key(row):
 fyn_df = pd.read_csv(os.path.join(FIRM_DIR, f"{FIRM_NAME}_fynancial_contacts.csv"))
 orion_df = pd.read_csv(os.path.join(FIRM_DIR, f"{FIRM_NAME}_orion_contacts.csv"))
 
+# NEW: give every source Orion row a stable unique id so duplicate-Orion_Id source
+# records (e.g. same Orion_Id with two different Orion_OrionId values) can be tracked
+# individually instead of collapsing into "already matched" and disappearing.
+orion_df = orion_df.reset_index(drop=False).rename(columns={"index": "_orion_row_id"})
+
 # Ensure Orion_OrionId and Fynancial_OrionId are strings for matching
 orion_df["Orion_OrionId"] = orion_df["Orion_OrionId"].apply(
     lambda x: str(int(float(x))) if pd.notna(x) and str(x).strip() not in ("", "nan") else None
@@ -161,6 +198,20 @@ orion_df["Orion_OrionId"] = orion_df["Orion_OrionId"].apply(
 fyn_df["Fynancial_OrionId"] = fyn_df["Fynancial_OrionId"].apply(
     lambda x: str(int(float(x))) if pd.notna(x) and str(x).strip() not in ("", "nan") else None
 )
+
+# NEW: Fynancial_OrionUsername is not a matching key — it's an independent
+# signal from Fynancial's own system that SSO is already configured for that
+# user. Has_SSO is just a readable Yes/No derived from whether it's populated.
+fyn_df["Has_SSO"] = fyn_df["Fynancial_OrionUsername"].apply(
+    lambda x: "Yes" if pd.notna(x) and str(x).strip() not in ("", "nan") else "No"
+)
+
+if ONLY_NO_SSO_WITH_ORIONID:
+    fyn_df = fyn_df[
+        fyn_df["Fynancial_OrionId"].notna() & (fyn_df["Has_SSO"] == "No")
+    ].reset_index(drop=True)
+    print(f"ONLY_NO_SSO_WITH_ORIONID is on — filtered to {len(fyn_df)} Fynancial contacts "
+          f"(has OrionId, no SSO yet). Purple/Orion-only section will be skipped.")
 
 # -----------------------------
 # Normalize key columns
@@ -188,6 +239,7 @@ output_df["Orion_LastName"] = None
 output_df["fuzzy_score"] = None
 output_df["notes"] = None
 output_df["_forced_group_orion_id"] = None
+output_df["_orion_row_id"] = None  # NEW: tracks which specific source row was matched
 
 # -----------------------------
 # 1️⃣ Standard matching (non-household)
@@ -227,6 +279,7 @@ for idx, row in output_df.iterrows():
         output_df.at[idx, "Orion_OrionId"] = match["Orion_OrionId"]
         output_df.at[idx, "Orion_FirstName"] = match["Orion_FirstName"]
         output_df.at[idx, "Orion_LastName"] = match["Orion_LastName"]
+        output_df.at[idx, "_orion_row_id"] = match["_orion_row_id"]
         continue
 
     if len(email_match) == 1:
@@ -238,16 +291,33 @@ for idx, row in output_df.iterrows():
         output_df.at[idx, "Orion_OrionId"] = match["Orion_OrionId"]
         output_df.at[idx, "Orion_FirstName"] = match["Orion_FirstName"]
         output_df.at[idx, "Orion_LastName"] = match["Orion_LastName"]
+        output_df.at[idx, "_orion_row_id"] = match["_orion_row_id"]
         continue
 
     if len(orion_id_match) == 1:
         match = orion_id_match.iloc[0]
-        output_df.at[idx, "match_type"] = "OrionId"
+        # This branch is only reached when email_and_name/email_match/name_match
+        # were ambiguous (matched >1 Orion row) — usually because of a duplicate
+        # source record. Even so, check whether *this specific* matched row also
+        # agrees on email and/or name, so the match_type reflects the true
+        # strength of the match rather than looking like a weak OrionId-only hit.
+        email_agrees = match["email_norm"] == fyn_email
+        name_agrees = match["name_norm"] == fyn_name
+        if email_agrees and name_agrees:
+            mt = "Email_And_FullName_And_OrionId"
+        elif email_agrees:
+            mt = "Email_And_OrionId"
+        elif name_agrees:
+            mt = "FullName_And_OrionId"
+        else:
+            mt = "OrionId"
+        output_df.at[idx, "match_type"] = mt
         output_df.at[idx, "Orion_Id"] = match["Orion_Id"]
         output_df.at[idx, "Orion_UserId"] = match["Orion_UserId"]
         output_df.at[idx, "Orion_OrionId"] = match["Orion_OrionId"]
         output_df.at[idx, "Orion_FirstName"] = match["Orion_FirstName"]
         output_df.at[idx, "Orion_LastName"] = match["Orion_LastName"]
+        output_df.at[idx, "_orion_row_id"] = match["_orion_row_id"]
         continue
 
     if len(name_match) == 1:
@@ -259,6 +329,7 @@ for idx, row in output_df.iterrows():
         output_df.at[idx, "Orion_OrionId"] = match["Orion_OrionId"]
         output_df.at[idx, "Orion_FirstName"] = match["Orion_FirstName"]
         output_df.at[idx, "Orion_LastName"] = match["Orion_LastName"]
+        output_df.at[idx, "_orion_row_id"] = match["_orion_row_id"]
         continue
 
 # -----------------------------
@@ -277,6 +348,7 @@ for _, orion_row in orion_households.iterrows():
         output_df.at[idx, "Orion_FirstName"] = _orion_row["Orion_FirstName"]
         output_df.at[idx, "Orion_LastName"] = _orion_row["Orion_LastName"]
         output_df.at[idx, "match_type"] = match_type
+        output_df.at[idx, "_orion_row_id"] = _orion_row["_orion_row_id"]
 
     for idx, fyn_row in output_df.iterrows():
         if fyn_row["match_type"] != "No_match":
@@ -376,6 +448,7 @@ for idx, row in output_df.iterrows():
         output_df.at[idx, "Orion_OrionId"] = best_match["Orion_OrionId"]
         output_df.at[idx, "Orion_FirstName"] = best_match["Orion_FirstName"]
         output_df.at[idx, "Orion_LastName"] = best_match["Orion_LastName"]
+        output_df.at[idx, "_orion_row_id"] = best_match["_orion_row_id"]
 
     output_df.at[idx, "fuzzy_score"] = best_score
 
@@ -463,105 +536,165 @@ if "Fynancial_OrionId" in output_df.columns:
 # -----------------------------
 # 8️⃣ Unmatched Orion users
 # -----------------------------
-matched_orion_ids = output_df["Orion_Id"].dropna().unique()
-unmatched_orion = orion_df[~orion_df["Orion_Id"].isin(matched_orion_ids)].copy()
+# Skipped entirely in ONLY_NO_SSO_WITH_ORIONID mode: with a partial Fynancial
+# list, an Orion record with no Fynancial match usually just means that
+# person's Fynancial row wasn't included (e.g. they already have SSO), not
+# that it's a genuine orphan. Surfacing it as "purple" would be misleading.
+if not ONLY_NO_SSO_WITH_ORIONID:
+    # CHANGED: use the row-level _orion_row_id (not Orion_Id) to determine what's
+    # unmatched, so a duplicate source record sharing an Orion_Id with an
+    # already-matched row no longer silently disappears.
+    matched_orion_row_ids = output_df["_orion_row_id"].dropna().unique()
+    unmatched_orion = orion_df[~orion_df["_orion_row_id"].isin(matched_orion_row_ids)].copy()
 
-unmatched_rows = pd.DataFrame({
-    "Fynancial_UserUniqueId": None,
-    "Fynancial_Role": None,
-    "Fynancial_FirstName": None,
-    "Fynancial_LastName": None,
-    "Fynancial_Email": None,
-    "Fynancial_OrionId": None,
-    "email_norm": None,
-    "name_norm": None,
-    "match_type": "Orion_No_Fynancial_Match",
-    "Orion_Id": unmatched_orion["Orion_Id"].values,
-    "Orion_UserId": unmatched_orion["Orion_UserId"].values,
-    "Orion_OrionId": unmatched_orion["Orion_OrionId"].values,
-    "Orion_FirstName": unmatched_orion["Orion_FirstName"].values,
-    "Orion_LastName": unmatched_orion["Orion_LastName"].values,
-    "fuzzy_score": None,
-    "notes": None,
-    "_forced_group_orion_id": None,
-})
+    unmatched_rows = pd.DataFrame({
+        "Fynancial_UserUniqueId": None,
+        "Fynancial_Role": None,
+        "Fynancial_FirstName": None,
+        "Fynancial_LastName": None,
+        "Fynancial_Email": None,
+        "Fynancial_OrionId": None,
+        "Fynancial_OrionUsername": None,
+        "Has_SSO": None,
+        "email_norm": None,
+        "name_norm": None,
+        "match_type": "Orion_No_Fynancial_Match",
+        "Orion_Id": unmatched_orion["Orion_Id"].values,
+        "Orion_UserId": unmatched_orion["Orion_UserId"].values,
+        "Orion_OrionId": unmatched_orion["Orion_OrionId"].values,
+        "Orion_FirstName": unmatched_orion["Orion_FirstName"].values,
+        "Orion_LastName": unmatched_orion["Orion_LastName"].values,
+        "fuzzy_score": None,
+        "notes": None,
+        "_forced_group_orion_id": None,
+        "_orion_row_id": unmatched_orion["_orion_row_id"].values,
+    })
 
-output_df = pd.concat([output_df, unmatched_rows], ignore_index=True)
+    output_df = pd.concat([output_df, unmatched_rows], ignore_index=True)
 
 # -----------------------------
 # 8b️⃣ Re-group Orion_No_Fynancial_Match rows whose Orion_UserId matches a Fynancial_Email
 # -----------------------------
-fyn_email_to_anchor = {}
+if not ONLY_NO_SSO_WITH_ORIONID:
+    fyn_email_to_anchor = {}
 
-for _, row in output_df[output_df["match_type"] != "Orion_No_Fynancial_Match"].iterrows():
-    fyn_email = row.get("Fynancial_Email")
-    if pd.isna(fyn_email) or str(fyn_email).strip() in ("", "nan"):
-        continue
-    norm_email = normalize_val(fyn_email)
-    if not norm_email or norm_email == "nan":
-        continue
+    for _, row in output_df[output_df["match_type"] != "Orion_No_Fynancial_Match"].iterrows():
+        fyn_email = row.get("Fynancial_Email")
+        if pd.isna(fyn_email) or str(fyn_email).strip() in ("", "nan"):
+            continue
+        norm_email = normalize_val(fyn_email)
+        if not norm_email or norm_email == "nan":
+            continue
 
-    fyn_orion = row.get("Fynancial_OrionId")
-    orion_id = row.get("Orion_Id")
-    fyn_uid = row.get("Fynancial_UserUniqueId")
+        fyn_orion = row.get("Fynancial_OrionId")
+        orion_id = row.get("Orion_Id")
+        fyn_uid = row.get("Fynancial_UserUniqueId")
 
-    if pd.notna(fyn_orion) and str(fyn_orion).strip() not in ("", "nan"):
-        anchor = ("fyn_orion", str(fyn_orion))
-    elif pd.notna(orion_id):
-        anchor = ("orion_id", str(orion_id))
-    elif pd.notna(fyn_uid) and str(fyn_uid).strip() not in ("", "nan"):
-        anchor = ("fyn_uid", str(fyn_uid))
-    else:
-        continue
-
-    if norm_email not in fyn_email_to_anchor:
-        fyn_email_to_anchor[norm_email] = []
-    if anchor not in fyn_email_to_anchor[norm_email]:
-        fyn_email_to_anchor[norm_email].append(anchor)
-
-no_fyn_indices = output_df[output_df["match_type"] == "Orion_No_Fynancial_Match"].index.tolist()
-indices_to_drop = []
-new_rows = []
-
-for idx in no_fyn_indices:
-    row = output_df.loc[idx]
-    orion_email = row.get("Orion_UserId")
-    if pd.isna(orion_email) or str(orion_email).strip() in ("", "nan"):
-        continue
-    norm_orion_email = normalize_val(orion_email)
-    anchors = fyn_email_to_anchor.get(norm_orion_email, [])
-
-    if not anchors:
-        continue
-
-    indices_to_drop.append(idx)
-
-    for anchor_type, anchor_val in anchors:
-        new_row = row.copy()
-        if anchor_type == "fyn_orion":
-            new_row["Fynancial_OrionId"] = anchor_val
-            new_row["_forced_group_orion_id"] = None
-        elif anchor_type == "orion_id":
-            new_row["Fynancial_OrionId"] = None
-            new_row["_forced_group_orion_id"] = f"orion_id_{anchor_val}"
+        if pd.notna(fyn_orion) and str(fyn_orion).strip() not in ("", "nan"):
+            anchor = ("fyn_orion", str(fyn_orion))
+        elif pd.notna(orion_id):
+            anchor = ("orion_id", str(orion_id))
+        elif pd.notna(fyn_uid) and str(fyn_uid).strip() not in ("", "nan"):
+            anchor = ("fyn_uid", str(fyn_uid))
         else:
-            new_row["Fynancial_OrionId"] = None
-            new_row["_forced_group_orion_id"] = f"fyn_uid_{anchor_val}"
-        new_rows.append(new_row)
+            continue
 
-if indices_to_drop:
-    output_df = output_df.drop(index=indices_to_drop).reset_index(drop=True)
-if new_rows:
-    output_df = pd.concat([output_df, pd.DataFrame(new_rows)], ignore_index=True)
+        if norm_email not in fyn_email_to_anchor:
+            fyn_email_to_anchor[norm_email] = []
+        if anchor not in fyn_email_to_anchor[norm_email]:
+            fyn_email_to_anchor[norm_email].append(anchor)
+
+    no_fyn_indices = output_df[output_df["match_type"] == "Orion_No_Fynancial_Match"].index.tolist()
+    indices_to_drop = []
+    new_rows = []
+
+    for idx in no_fyn_indices:
+        row = output_df.loc[idx]
+        orion_email = row.get("Orion_UserId")
+        if pd.isna(orion_email) or str(orion_email).strip() in ("", "nan"):
+            continue
+        norm_orion_email = normalize_val(orion_email)
+        anchors = fyn_email_to_anchor.get(norm_orion_email, [])
+
+        if not anchors:
+            continue
+
+        indices_to_drop.append(idx)
+
+        for anchor_type, anchor_val in anchors:
+            new_row = row.copy()
+            if anchor_type == "fyn_orion":
+                new_row["Fynancial_OrionId"] = anchor_val
+                new_row["_forced_group_orion_id"] = None
+            elif anchor_type == "orion_id":
+                new_row["Fynancial_OrionId"] = None
+                new_row["_forced_group_orion_id"] = f"orion_id_{anchor_val}"
+            else:
+                new_row["Fynancial_OrionId"] = None
+                new_row["_forced_group_orion_id"] = f"fyn_uid_{anchor_val}"
+            new_rows.append(new_row)
+
+    if indices_to_drop:
+        output_df = output_df.drop(index=indices_to_drop).reset_index(drop=True)
+    if new_rows:
+        output_df = pd.concat([output_df, pd.DataFrame(new_rows)], ignore_index=True)
 
 # -----------------------------
 # 9️⃣ Flag shared Orion_Id
 # -----------------------------
-orion_id_counts = output_df[output_df["Orion_Id"].notna()].groupby("Orion_Id").size()
-duplicate_orion_ids = set(orion_id_counts[orion_id_counts > 1].index.tolist())
+# Only count Orion_Id as "shared" when more than one *matched* (Fynancial-side)
+# record points to it — that's a genuine reconciliation problem. This
+# deliberately excludes Orion_No_Fynancial_Match rows, so a matched record
+# isn't dragged into a shared/attention group just because its source has an
+# unmatched duplicate sibling (different Orion_OrionId) sitting next to it.
+matched_side_counts = output_df[
+    output_df["Orion_Id"].notna() &
+    (output_df["match_type"] != "Orion_No_Fynancial_Match")
+].groupby("Orion_Id").size()
+duplicate_orion_ids = set(matched_side_counts[matched_side_counts > 1].index.tolist())
+
+# Track Orion_Id values duplicated in the *source* file (e.g. same Orion_Id
+# with two different Orion_OrionId rows) separately — used to keep the
+# unmatched sibling standalone (see get_group_key) and to note it below.
+orion_id_source_counts = orion_df.groupby("Orion_Id").size()
+duplicate_source_orion_ids = set(orion_id_source_counts[orion_id_source_counts > 1].index.tolist())
+
 output_df["dupe_orion_id_found"] = output_df["Orion_Id"].apply(
     lambda x: True if x in duplicate_orion_ids else False
 )
+
+# -----------------------------
+# 9b️⃣ Auto-note the unmatched sibling in a duplicate Orion source record
+# -----------------------------
+SOURCE_DUPE_NOTE = "Matches the Orion_Id of another (matched) record, but does not match on OrionId"
+# Only Orion_Ids where at least one sibling row actually matched a Fynancial
+# contact — otherwise every row in the group is a plain orphan, and calling
+# out a "matched" sibling that doesn't exist would be misleading.
+orion_ids_with_a_match = set(
+    output_df.loc[output_df["match_type"] != "Orion_No_Fynancial_Match", "Orion_Id"].dropna()
+)
+for idx, row in output_df.iterrows():
+    if row["match_type"] != "Orion_No_Fynancial_Match":
+        continue
+    oid = row["Orion_Id"]
+    if pd.notna(oid) and oid in duplicate_source_orion_ids and oid in orion_ids_with_a_match:
+        existing_note = row.get("notes")
+        if pd.isna(existing_note) or str(existing_note).strip() in ("", "nan"):
+            output_df.at[idx, "notes"] = SOURCE_DUPE_NOTE
+        elif SOURCE_DUPE_NOTE not in str(existing_note):
+            output_df.at[idx, "notes"] = f"{existing_note}; {SOURCE_DUPE_NOTE}"
+
+# -----------------------------
+# 9c️⃣ Flag SSO inconsistency: Fynancial says SSO is set up, but no Orion match was found
+# -----------------------------
+SSO_NO_MATCH_NOTE = "Fynancial shows SSO already set up (Fynancial_OrionUsername populated), but no matching Orion record was found"
+for idx, row in output_df.iterrows():
+    if row.get("Has_SSO") == "Yes" and pd.isna(row.get("Orion_Id")):
+        existing_note = row.get("notes")
+        if pd.isna(existing_note) or str(existing_note).strip() in ("", "nan"):
+            output_df.at[idx, "notes"] = SSO_NO_MATCH_NOTE
+        elif SSO_NO_MATCH_NOTE not in str(existing_note):
+            output_df.at[idx, "notes"] = f"{existing_note}; {SSO_NO_MATCH_NOTE}"
 
 # -----------------------------
 # Final column order
@@ -573,6 +706,8 @@ final_columns = [
     "Fynancial_LastName",
     "Fynancial_Email",
     "Fynancial_OrionId",
+    "Fynancial_OrionUsername",
+    "Has_SSO",
     "Orion_Id",
     "Orion_UserId",
     "Orion_OrionId",
@@ -746,7 +881,10 @@ for _, row in final_df.iterrows():
         color_lookup[uid] = color
     orion_id = row.get("Orion_Id")
     if pd.notna(orion_id):
-        color_lookup.setdefault(f"_orion_{orion_id}", color)
+        # Orion_Id alone is not a safe key when a duplicate source record
+        # exists (two rows can share the same Orion_Id with different
+        # Orion_OrionId values, and need different colors). Combine both.
+        color_lookup.setdefault(f"_orion_{orion_id}_{row.get('Orion_OrionId')}", color)
 
 final_df = final_df.drop(columns=["_gk", "_row_color"])
 
@@ -795,6 +933,11 @@ if len(rows_to_move) > 0:
 # -----------------------------
 def sort_by_color(df):
     df = df.copy()
+    if df.empty:
+        # An empty section (e.g. a batch with zero confident matches) hits a
+        # pandas edge case where .apply(axis=1) on 0 rows can return a
+        # DataFrame instead of a Series. Nothing to sort anyway.
+        return df
     gk_series = df.apply(get_merged_gk, axis=1)
     group_sizes = gk_series.map(gk_series.value_counts())
 
@@ -814,7 +957,7 @@ def sort_by_color(df):
             return color_lookup.get(uid)
         orion_id = r.get("Orion_Id")
         if pd.notna(orion_id):
-            return color_lookup.get(f"_orion_{orion_id}")
+            return color_lookup.get(f"_orion_{orion_id}_{r.get('Orion_OrionId')}")
         return None
 
     df["_cr"] = df.apply(lambda r: COLOR_RANK.get(get_row_color(r), 99), axis=1)
@@ -863,11 +1006,23 @@ def sort_by_color(df):
         ) else 0,
         axis=1
     )
+    # Push "matches another record's Orion_Id but not its OrionId" purple
+    # rows (source-side duplicates) to the very bottom of the purple section.
+    df["_source_dupe_purple_sort"] = df.apply(
+        lambda r: 1 if (
+            r["match_type"] == "Orion_No_Fynancial_Match" and
+            pd.notna(r["Orion_Id"]) and
+            r["Orion_Id"] in duplicate_source_orion_ids
+        ) else 0,
+        axis=1
+    )
     df = df.sort_values(
-        ["_cr", "_has_orion_no_fyn", "_group_size", "_match_sort", "_yellow_nomatch_sort", "_mt_sort", "_fuzzy_sort", "_orig"],
-        ascending=[True, True, False, True, True, True, True, True]
+        ["_cr", "_has_orion_no_fyn", "_group_size", "_match_sort", "_yellow_nomatch_sort",
+         "_mt_sort", "_fuzzy_sort", "_source_dupe_purple_sort", "_orig"],
+        ascending=[True, True, False, True, True, True, True, True, True]
     ).drop(columns=["_cr", "_has_orion_no_fyn", "_group_size", "_has_match", "_has_nomatch",
-                    "_match_sort", "_yellow_nomatch_sort", "_mt_sort", "_fuzzy_sort", "_orig"])
+                    "_match_sort", "_yellow_nomatch_sort", "_mt_sort", "_fuzzy_sort",
+                    "_source_dupe_purple_sort", "_orig"])
     return df.reset_index(drop=True)
 
 df_confident = sort_by_color(df_confident)
@@ -913,7 +1068,7 @@ for col_idx, col in enumerate(final_df_excel.columns, start=1):
 # Column dividers
 divider_side = Side(style="medium")
 divider_cols = [
-    final_df_excel.columns.get_loc("Fynancial_OrionId") + 1,
+    final_df_excel.columns.get_loc("Has_SSO") + 1,
     final_df_excel.columns.get_loc("Orion_LastName") + 1,
 ]
 
@@ -926,15 +1081,18 @@ match_type_col = final_df_excel.columns.get_loc("match_type") + 1
 shared_col = final_df_excel.columns.get_loc("dupe_orion_id_found") + 1
 uid_col = final_df_excel.columns.get_loc("Fynancial_UserUniqueId") + 1
 orion_id_col = final_df_excel.columns.get_loc("Orion_Id") + 1
+orion_orionid_col = final_df_excel.columns.get_loc("Orion_OrionId") + 1
 
 for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
     uid = row[uid_col - 1].value
     orion_id = row[orion_id_col - 1].value
+    orion_orionid = row[orion_orionid_col - 1].value
+    orion_key = f"_orion_{orion_id}_{orion_orionid}"
 
     if uid and uid in color_lookup:
         hex_color = color_lookup[uid]
-    elif orion_id and f"_orion_{orion_id}" in color_lookup:
-        hex_color = color_lookup[f"_orion_{orion_id}"]
+    elif orion_id and orion_key in color_lookup:
+        hex_color = color_lookup[orion_key]
     else:
         hex_color = None
 
@@ -952,11 +1110,13 @@ for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
 
     shared_cell = row[shared_col - 1]
     if shared_cell.value is True:
-        row_color = color_lookup.get(uid) or color_lookup.get(f"_orion_{orion_id}", LIGHT_RED)
+        row_color = color_lookup.get(uid) or color_lookup.get(orion_key, LIGHT_RED)
         if row_color == DARK_RED:
             dupe_color = DARK_RED
         elif row_color == LIGHT_BLUE:
             dupe_color = LIGHT_BLUE
+        elif row_color == LIGHT_GREEN:
+            dupe_color = LIGHT_GREEN
         else:
             dupe_color = LIGHT_RED
         shared_cell.fill = PatternFill(start_color=dupe_color, end_color=dupe_color, fill_type="solid")
